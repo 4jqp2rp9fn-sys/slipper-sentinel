@@ -1,0 +1,44 @@
+name: Mercari Anomaly Watcher
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mercari-anomaly
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r mercari_anomaly/requirements.txt
+
+      - name: Run watcher
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python -m mercari_anomaly.main
+
+      - name: Persist DB
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mercari_anomaly/data/listings.db || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(data): update listings.db [skip ci]"
+            git push
+          else
+            echo "No DB changes to commit."
+          fi
