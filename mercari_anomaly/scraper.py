@@ -2,12 +2,17 @@
 
 Mercari's JSON API requires DPoP-signed requests and rejects unauthenticated
 clients with 401. Instead we render the public search results page in a real
-Chromium browser and parse listing cards from the DOM. This is slower but
-robust against API changes and works from GitHub Actions.
+Chromium browser and parse listing cards from the DOM.
+
+The DOM is rendered client-side and Mercari changes class names frequently, so
+we rely on structural selectors (anchors pointing at ``/item/m\\d+``) instead
+of fragile class names. When no cards are found we dump a screenshot and the
+raw HTML to ``debug/`` for inspection.
 """
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from typing import Iterable
@@ -38,16 +43,20 @@ KEYWORDS = [
     "スリッパ",
 ]
 
-# Item card selector. Mercari uses <li> wrappers around <a data-testid="thumbnail-link">.
-ITEM_SELECTOR = 'a[data-testid="thumbnail-link"]'
+DEBUG_DIR = os.environ.get("MERCARI_DEBUG_DIR", "debug")
+
+# Structural selector: any anchor pointing at an item page. This is the most
+# stable contract Mercari exposes (the URL scheme has been stable for years).
+ITEM_ANCHOR_SELECTOR = 'a[href*="/item/m"]'
 ITEM_ID_RE = re.compile(r"/item/(m\d+)")
-PRICE_RE = re.compile(r"[\d,]+")
+PRICE_RE = re.compile(r"[\d,]{2,}")
 
 
 def _parse_price(text: str) -> int:
     if not text:
         return 0
-    m = PRICE_RE.search(text.replace("¥", "").replace("￥", ""))
+    cleaned = text.replace("¥", "").replace("￥", "").replace("円", "")
+    m = PRICE_RE.search(cleaned)
     if not m:
         return 0
     try:
@@ -56,72 +65,148 @@ def _parse_price(text: str) -> int:
         return 0
 
 
+def _dump_debug(page, keyword: str, reason: str) -> None:
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        safe_kw = re.sub(r"[^A-Za-z0-9_-]", "_", keyword)[:40]
+        prefix = os.path.join(DEBUG_DIR, f"{safe_kw}_{reason}")
+        page.screenshot(path=f"{prefix}.png", full_page=True)
+        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log.warning("Wrote debug artifacts to %s.{png,html}", prefix)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Failed to write debug artifacts: %s", exc)
+
+
+def _autoscroll(page, steps: int = 4, delay_ms: int = 600) -> None:
+    """Trigger lazy-loaded cards by scrolling down a few viewports."""
+    for _ in range(steps):
+        page.evaluate("window.scrollBy(0, window.innerHeight)")
+        page.wait_for_timeout(delay_ms)
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(200)
+
+
+def _extract_items(page, keyword: str, limit: int) -> list[dict]:
+    """Pull listing data out of the page via a single JS evaluation.
+
+    We resolve each ``a[href*="/item/m"]`` to its enclosing card-ish ancestor
+    (``li``, ``article``, or a wrapping ``div``) and read the title/price/image
+    from inside that subtree. This is resilient to class-name churn.
+    """
+    raw = page.evaluate(
+        """
+        (limit) => {
+          const anchors = Array.from(document.querySelectorAll('a[href*="/item/m"]'));
+          const seen = new Set();
+          const out = [];
+          for (const a of anchors) {
+            const m = a.getAttribute('href')?.match(/\\/item\\/(m\\d+)/);
+            if (!m) continue;
+            const id = m[1];
+            if (seen.has(id)) continue;
+            seen.add(id);
+
+            // Walk up to a reasonable card container.
+            let card = a;
+            for (let i = 0; i < 5 && card.parentElement; i++) {
+              card = card.parentElement;
+              if (card.tagName === 'LI' || card.tagName === 'ARTICLE') break;
+            }
+
+            const img = card.querySelector('img');
+            const title =
+              a.getAttribute('aria-label') ||
+              img?.getAttribute('alt') ||
+              card.querySelector('[itemprop="name"]')?.textContent ||
+              '';
+
+            // Price: look for a node whose text starts with ¥ or contains digits+円.
+            let priceText = '';
+            const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+            let n;
+            while ((n = walker.nextNode())) {
+              const t = (n.nodeValue || '').trim();
+              if (!t) continue;
+              if (/[¥￥]\\s*[\\d,]{2,}/.test(t) || /[\\d,]{2,}\\s*円/.test(t)) {
+                priceText = t;
+                break;
+              }
+            }
+
+            out.push({
+              id,
+              title: title.trim(),
+              price_text: priceText,
+              image: img?.getAttribute('src') || img?.getAttribute('data-src') || '',
+            });
+            if (out.length >= limit) break;
+          }
+          return out;
+        }
+        """,
+        limit,
+    )
+
+    now = int(time.time())
+    items: list[dict] = []
+    for r in raw:
+        items.append({
+            "id": r["id"],
+            "title": r["title"] or r["id"],
+            "price": _parse_price(r.get("price_text", "")),
+            "url": f"https://jp.mercari.com/item/{r['id']}",
+            "image": r.get("image", ""),
+            "created_at": now,
+            "keyword": keyword,
+            "fetched_at": now,
+        })
+    return items
+
+
 def fetch_keyword(page, keyword: str, limit: int = 60) -> list[dict]:
     """Fetch most recent listings for a single keyword using an open Playwright page."""
     url = SEARCH_URL.format(kw=quote(keyword))
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        # Wait for client-rendered item anchors. Fall back to networkidle if the
+        # selector never appears (e.g. Mercari shows an empty-state).
         try:
-            page.wait_for_selector(ITEM_SELECTOR, timeout=15000)
+            page.wait_for_selector(ITEM_ANCHOR_SELECTOR, timeout=20000)
         except Exception:
-            log.warning("No item cards rendered for %r", keyword)
-            return []
-        # Let lazy images settle a moment.
-        page.wait_for_timeout(1500)
-
-        anchors = page.query_selector_all(ITEM_SELECTOR)
-        now = int(time.time())
-        items: list[dict] = []
-        for a in anchors[:limit]:
             try:
-                href = a.get_attribute("href") or ""
-                m = ITEM_ID_RE.search(href)
-                if not m:
-                    continue
-                item_id = m.group(1)
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
 
-                aria = a.get_attribute("aria-label") or ""
-                title = aria.strip()
-                img_el = a.query_selector("img")
-                image = ""
-                if img_el:
-                    image = img_el.get_attribute("src") or img_el.get_attribute("data-src") or ""
-                    if not title:
-                        title = (img_el.get_attribute("alt") or "").strip()
+        _autoscroll(page)
 
-                # Price text usually rendered inside the card.
-                price_text = ""
-                price_el = a.query_selector('[class*="price"], [data-testid*="price"], .merPrice')
-                if price_el:
-                    price_text = price_el.inner_text()
-                if not price_text:
-                    price_text = a.inner_text() or ""
-                price = _parse_price(price_text)
+        anchor_count = page.evaluate(
+            f"document.querySelectorAll('{ITEM_ANCHOR_SELECTOR}').length"
+        )
+        log.info(
+            "keyword=%r title=%r url=%s anchors=%d",
+            keyword, page.title(), page.url, anchor_count,
+        )
 
-                items.append({
-                    "id": item_id,
-                    "title": title or item_id,
-                    "price": price,
-                    "url": f"https://jp.mercari.com/item/{item_id}",
-                    "image": image,
-                    "created_at": now,
-                    "keyword": keyword,
-                    "fetched_at": now,
-                })
-            except Exception as exc:  # pragma: no cover - defensive
-                log.warning("Failed to parse a card: %s", exc)
-                continue
+        items = _extract_items(page, keyword, limit)
+        log.info("Parsed %d items for %r", len(items), keyword)
 
-        log.info("Fetched %d items for %r", len(items), keyword)
+        if not items:
+            _dump_debug(page, keyword, "no_items")
         return items
     except Exception as exc:
         log.warning("Browser fetch failed for %r: %s", keyword, exc)
+        try:
+            _dump_debug(page, keyword, "exception")
+        except Exception:
+            pass
         return []
 
 
 def fetch_all(keywords: Iterable[str] = KEYWORDS) -> list[dict]:
     """Open one browser, reuse a single page across all keywords."""
-    # Import here so unit tests / non-scrape paths don't require playwright.
     from playwright.sync_api import sync_playwright
 
     seen: dict[str, dict] = {}
@@ -150,7 +235,7 @@ def fetch_all(keywords: Iterable[str] = KEYWORDS) -> list[dict]:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     items = fetch_all()
     print(f"Fetched {len(items)} unique listings")
     for it in items[:3]:
