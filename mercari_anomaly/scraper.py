@@ -1,39 +1,32 @@
-"""Fetch Mercari Japan listings via headless browser (Playwright).
+"""Fetch Mercari Japan listings via the internal search API (no browser).
 
-Mercari's JSON API requires DPoP-signed requests and rejects unauthenticated
-clients with 401. Instead we render the public search results page in a real
-Chromium browser and parse listing cards from the DOM.
+Mercari's public ``api.mercari.jp/v2/entities:search`` endpoint accepts
+anonymous requests as long as each call carries a freshly-signed DPoP JWT
+(RFC 9449). We generate an ephemeral ES256 keypair per process, sign one
+DPoP token per request, and parse the JSON response.
 
-The DOM is rendered client-side and Mercari changes class names frequently, so
-we rely on structural selectors (anchors pointing at ``/item/m\\d+``) instead
-of fragile class names. When no cards are found we dump a screenshot and the
-raw HTML to ``debug/`` for inspection.
+Schema returned per item:
+    id, title, price, url, image, created_at, keyword, fetched_at
 """
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
-import re
 import time
-from typing import Iterable
-from urllib.parse import quote
+import uuid
+from typing import Any, Iterable
+
+import requests
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes, serialization
 
 log = logging.getLogger(__name__)
 
-SEARCH_URL = (
-    "https://jp.mercari.com/search?keyword={kw}"
-    "&status=on_sale&sort=created_time&order=desc"
-)
-
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
-EXTRA_HEADERS = {
-    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    "Upgrade-Insecure-Requests": "1",
-}
+SEARCH_ENDPOINT = "https://api.mercari.jp/v2/entities:search"
+ITEM_URL = "https://jp.mercari.com/item/{id}"
+DEBUG_DIR = os.environ.get("MERCARI_DEBUG_DIR", "debug")
 
 KEYWORDS = [
     "slippers",
@@ -43,194 +36,238 @@ KEYWORDS = [
     "スリッパ",
 ]
 
-DEBUG_DIR = os.environ.get("MERCARI_DEBUG_DIR", "debug")
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
-# Structural selector: any anchor pointing at an item page. This is the most
-# stable contract Mercari exposes (the URL scheme has been stable for years).
-ITEM_ANCHOR_SELECTOR = 'a[href*="/item/m"]'
-ITEM_ID_RE = re.compile(r"/item/(m\d+)")
-PRICE_RE = re.compile(r"[\d,]{2,}")
+BASE_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "*/*",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Content-Type": "application/json; charset=utf-8",
+    "Origin": "https://jp.mercari.com",
+    "Referer": "https://jp.mercari.com/",
+    "X-Platform": "web",
+}
+
+# Mercari item status / sort enums used by v2 search.
+SEARCH_PAYLOAD_TEMPLATE: dict[str, Any] = {
+    "userId": "",
+    "pageSize": 60,
+    "pageToken": "",
+    "searchSessionId": "",  # filled per request
+    "indexRouting": "INDEX_ROUTING_UNSPECIFIED",
+    "thumbnailTypes": [],
+    "searchCondition": {
+        "keyword": "",  # filled per keyword
+        "excludeKeyword": "",
+        "sort": "SORT_CREATED_TIME",
+        "order": "ORDER_DESC",
+        "status": ["STATUS_ON_SALE"],
+        "sizeId": [],
+        "categoryId": [],
+        "brandId": [],
+        "sellerId": [],
+        "priceMin": 0,
+        "priceMax": 0,
+        "itemConditionId": [],
+        "shippingPayerId": [],
+        "shippingFromArea": [],
+        "shippingMethod": [],
+        "colorId": [],
+        "hasCoupon": False,
+        "attributes": [],
+        "itemTypes": [],
+        "skuIds": [],
+    },
+    "defaultDatasets": ["DATASET_TYPE_MERCARI", "DATASET_TYPE_BEYOND"],
+    "serviceFrom": "suruga",
+    "withItemBrand": True,
+    "withItemSize": False,
+    "withItemPromotions": True,
+    "withItemSizes": True,
+    "withShopname": False,
+}
 
 
-def _parse_price(text: str) -> int:
-    if not text:
-        return 0
-    cleaned = text.replace("¥", "").replace("￥", "").replace("円", "")
-    m = PRICE_RE.search(cleaned)
-    if not m:
-        return 0
-    try:
-        return int(m.group(0).replace(",", ""))
-    except ValueError:
-        return 0
+# ---------------------------------------------------------------------------
+# DPoP signing
+# ---------------------------------------------------------------------------
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-def _dump_debug(page, keyword: str, reason: str) -> None:
+class DPoPSigner:
+    """Ephemeral ES256 keypair + per-request DPoP JWT generator."""
+
+    def __init__(self) -> None:
+        self._key = ec.generate_private_key(ec.SECP256R1())
+        nums = self._key.public_key().public_numbers()
+        # JWK fields must be 32-byte big-endian, base64url, no padding.
+        x = nums.x.to_bytes(32, "big")
+        y = nums.y.to_bytes(32, "big")
+        self._jwk = {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": _b64url(x),
+            "y": _b64url(y),
+        }
+
+    def sign(self, method: str, url: str) -> str:
+        header = {"typ": "dpop+jwt", "alg": "ES256", "jwk": self._jwk}
+        payload = {
+            "iat": int(time.time()),
+            "jti": str(uuid.uuid4()),
+            "htu": url,
+            "htm": method.upper(),
+            "uuid": str(uuid.uuid4()),
+        }
+        signing_input = (
+            _b64url(json.dumps(header, separators=(",", ":")).encode())
+            + "."
+            + _b64url(json.dumps(payload, separators=(",", ":")).encode())
+        ).encode("ascii")
+
+        der_sig = self._key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
+        # DER → raw (r||s), 32 bytes each.
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+        r, s = decode_dss_signature(der_sig)
+        raw_sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+        return signing_input.decode("ascii") + "." + _b64url(raw_sig)
+
+
+_signer = DPoPSigner()
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+def _dump_debug(keyword: str, reason: str, body: str) -> None:
     try:
         os.makedirs(DEBUG_DIR, exist_ok=True)
-        safe_kw = re.sub(r"[^A-Za-z0-9_-]", "_", keyword)[:40]
-        prefix = os.path.join(DEBUG_DIR, f"{safe_kw}_{reason}")
-        page.screenshot(path=f"{prefix}.png", full_page=True)
-        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log.warning("Wrote debug artifacts to %s.{png,html}", prefix)
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("Failed to write debug artifacts: %s", exc)
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in keyword)[:40]
+        path = os.path.join(DEBUG_DIR, f"{safe}_{reason}_{int(time.time())}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        log.warning("Dumped debug payload to %s", path)
+    except Exception as exc:  # pragma: no cover
+        log.warning("Failed to write debug dump: %s", exc)
 
 
-def _autoscroll(page, steps: int = 4, delay_ms: int = 600) -> None:
-    """Trigger lazy-loaded cards by scrolling down a few viewports."""
-    for _ in range(steps):
-        page.evaluate("window.scrollBy(0, window.innerHeight)")
-        page.wait_for_timeout(delay_ms)
-    page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(200)
+def _post_search(payload: dict, *, retries: int = 3) -> tuple[int, str]:
+    """POST with DPoP signing + exponential backoff. Returns (status, body)."""
+    last_status = 0
+    last_body = ""
+    for attempt in range(1, retries + 1):
+        headers = dict(BASE_HEADERS)
+        headers["DPoP"] = _signer.sign("POST", SEARCH_ENDPOINT)
+        try:
+            resp = requests.post(
+                SEARCH_ENDPOINT,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=20,
+            )
+            last_status = resp.status_code
+            last_body = resp.text
+            if resp.status_code == 200:
+                return last_status, last_body
+            log.warning(
+                "Mercari API %s on attempt %d/%d", resp.status_code, attempt, retries
+            )
+            if resp.status_code in (400, 401, 403):
+                # Briefer backoff for auth-ish errors; longer for 429/5xx.
+                time.sleep(1.5 * attempt)
+            else:
+                time.sleep(2.0 * attempt)
+        except requests.RequestException as exc:
+            log.warning("Request error on attempt %d/%d: %s", attempt, retries, exc)
+            time.sleep(2.0 * attempt)
+    return last_status, last_body
 
 
-def _extract_items(page, keyword: str, limit: int) -> list[dict]:
-    """Pull listing data out of the page via a single JS evaluation.
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
 
-    We resolve each ``a[href*="/item/m"]`` to its enclosing card-ish ancestor
-    (``li``, ``article``, or a wrapping ``div``) and read the title/price/image
-    from inside that subtree. This is resilient to class-name churn.
-    """
-    raw = page.evaluate(
-        """
-        (limit) => {
-          const anchors = Array.from(document.querySelectorAll('a[href*="/item/m"]'));
-          const seen = new Set();
-          const out = [];
-          for (const a of anchors) {
-            const m = a.getAttribute('href')?.match(/\\/item\\/(m\\d+)/);
-            if (!m) continue;
-            const id = m[1];
-            if (seen.has(id)) continue;
-            seen.add(id);
-
-            // Walk up to a reasonable card container.
-            let card = a;
-            for (let i = 0; i < 5 && card.parentElement; i++) {
-              card = card.parentElement;
-              if (card.tagName === 'LI' || card.tagName === 'ARTICLE') break;
-            }
-
-            const img = card.querySelector('img');
-            const title =
-              a.getAttribute('aria-label') ||
-              img?.getAttribute('alt') ||
-              card.querySelector('[itemprop="name"]')?.textContent ||
-              '';
-
-            // Price: look for a node whose text starts with ¥ or contains digits+円.
-            let priceText = '';
-            const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-            let n;
-            while ((n = walker.nextNode())) {
-              const t = (n.nodeValue || '').trim();
-              if (!t) continue;
-              if (/[¥￥]\\s*[\\d,]{2,}/.test(t) || /[\\d,]{2,}\\s*円/.test(t)) {
-                priceText = t;
-                break;
-              }
-            }
-
-            out.push({
-              id,
-              title: title.trim(),
-              price_text: priceText,
-              image: img?.getAttribute('src') || img?.getAttribute('data-src') || '',
-            });
-            if (out.length >= limit) break;
-          }
-          return out;
-        }
-        """,
-        limit,
-    )
-
+def _parse_items(data: dict, keyword: str) -> list[dict]:
+    items_raw = data.get("items") or data.get("data") or []
     now = int(time.time())
-    items: list[dict] = []
-    for r in raw:
-        items.append({
-            "id": r["id"],
-            "title": r["title"] or r["id"],
-            "price": _parse_price(r.get("price_text", "")),
-            "url": f"https://jp.mercari.com/item/{r['id']}",
-            "image": r.get("image", ""),
-            "created_at": now,
+    out: list[dict] = []
+    for it in items_raw:
+        item_id = it.get("id") or it.get("itemId") or ""
+        if not item_id:
+            continue
+        try:
+            price = int(it.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0
+
+        thumbs = it.get("thumbnails") or []
+        image = ""
+        if thumbs and isinstance(thumbs, list):
+            image = thumbs[0] if isinstance(thumbs[0], str) else thumbs[0].get("url", "")
+        if not image:
+            image = it.get("thumbnail") or ""
+
+        created = it.get("created") or it.get("createdAt") or now
+        try:
+            created = int(created)
+        except (TypeError, ValueError):
+            created = now
+
+        out.append({
+            "id": item_id,
+            "title": (it.get("name") or it.get("title") or "").strip() or item_id,
+            "price": price,
+            "url": ITEM_URL.format(id=item_id),
+            "image": image,
+            "created_at": created,
             "keyword": keyword,
             "fetched_at": now,
         })
+    return out
+
+
+def fetch_keyword(keyword: str, limit: int = 60) -> list[dict]:
+    payload = json.loads(json.dumps(SEARCH_PAYLOAD_TEMPLATE))  # deep copy
+    payload["pageSize"] = limit
+    payload["searchSessionId"] = uuid.uuid4().hex
+    payload["searchCondition"]["keyword"] = keyword
+
+    status, body = _post_search(payload)
+    if status != 200:
+        log.warning("keyword=%r status=%d body[:200]=%r", keyword, status, body[:200])
+        if body:
+            _dump_debug(keyword, f"http_{status}", body)
+        return []
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        log.warning("keyword=%r non-JSON response", keyword)
+        _dump_debug(keyword, "non_json", body)
+        return []
+
+    items = _parse_items(data, keyword)
+    log.info("keyword=%r status=%d parsed=%d", keyword, status, len(items))
+    if not items:
+        _dump_debug(keyword, "empty_parse", body[:20000])
     return items
 
 
-def fetch_keyword(page, keyword: str, limit: int = 60) -> list[dict]:
-    """Fetch most recent listings for a single keyword using an open Playwright page."""
-    url = SEARCH_URL.format(kw=quote(keyword))
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-
-        # Wait for client-rendered item anchors. Fall back to networkidle if the
-        # selector never appears (e.g. Mercari shows an empty-state).
-        try:
-            page.wait_for_selector(ITEM_ANCHOR_SELECTOR, timeout=20000)
-        except Exception:
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
-
-        _autoscroll(page)
-
-        anchor_count = page.evaluate(
-            f"document.querySelectorAll('{ITEM_ANCHOR_SELECTOR}').length"
-        )
-        log.info(
-            "keyword=%r title=%r url=%s anchors=%d",
-            keyword, page.title(), page.url, anchor_count,
-        )
-
-        items = _extract_items(page, keyword, limit)
-        log.info("Parsed %d items for %r", len(items), keyword)
-
-        if not items:
-            _dump_debug(page, keyword, "no_items")
-        return items
-    except Exception as exc:
-        log.warning("Browser fetch failed for %r: %s", keyword, exc)
-        try:
-            _dump_debug(page, keyword, "exception")
-        except Exception:
-            pass
-        return []
-
-
 def fetch_all(keywords: Iterable[str] = KEYWORDS) -> list[dict]:
-    """Open one browser, reuse a single page across all keywords."""
-    from playwright.sync_api import sync_playwright
-
+    """Fetch each keyword sequentially and deduplicate by item id."""
     seen: dict[str, dict] = {}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            locale="ja-JP",
-            timezone_id="Asia/Tokyo",
-            viewport={"width": 1366, "height": 900},
-            extra_http_headers=EXTRA_HEADERS,
-        )
-        page = context.new_page()
-        try:
-            for kw in keywords:
-                for item in fetch_keyword(page, kw):
-                    seen.setdefault(item["id"], item)
-                time.sleep(1.0)  # be polite between keywords
-        finally:
-            context.close()
-            browser.close()
+    for kw in keywords:
+        for item in fetch_keyword(kw):
+            seen.setdefault(item["id"], item)
+        time.sleep(1.0)  # polite spacing between keywords
+    log.info("Total unique listings: %d", len(seen))
     return list(seen.values())
 
 
