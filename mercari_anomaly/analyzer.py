@@ -84,6 +84,11 @@ def analyze(items: list[dict], previous_prices: dict[str, int | None]) -> list[A
             "ワンピース",
             "カーディガン",
             "ジーンズ",
+            "パンプス",
+            "ヒール",
+            "tシャツ",
+            "シャツ",
+            "ラック",
         ]
 
         if any(word.lower() in title for word in blocked):
