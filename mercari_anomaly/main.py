@@ -4,6 +4,9 @@ from __future__ import annotations
 import logging
 import time
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from . import scraper, storage, analyzer, notifier
 
 log = logging.getLogger(__name__)

@@ -61,6 +61,14 @@ def analyze(items: list[dict], previous_prices: dict[str, int | None]) -> list[A
             spike_keywords.add(kw)
 
     for item in items:
+        title = item.get("title", "").lower()
+
+        if "キッズ" in title:
+            continue
+
+        if "レディース" in title:
+            continue
+
         a = Anomaly(item=item)
         kw = item.get("keyword", "")
         price = item.get("price", 0) or 0

@@ -31,7 +31,6 @@ DEBUG_DIR = os.environ.get("MERCARI_DEBUG_DIR", "debug")
 KEYWORDS = [
     "slippers",
     "sandals",
-    "クロッグ",
     "サンダル",
     "スリッパ",
 ]
