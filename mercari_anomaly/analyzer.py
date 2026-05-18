@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import statistics
+import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
@@ -71,29 +72,14 @@ def analyze(items: list[dict], previous_prices: dict[str, int | None]) -> list[A
             "ハンガー",
             "女の子",
             "ワンピース",
-            "25.5cm",
-            "25cm",
-            "24.5cm",
-            "24cm",
-            "23.5cm",
-            "23cm",
-            "22.5cm",
-            "22cm",
-            "21.5cm",
-            "21cm",
-            "20.5cm",
-            "20cm",
-            "19.5cm",
-            "19cm",
-            "18.5cm",
-            "18cm",
-            "17.5cm",
-            "17cm",
-            "16.5cm",
-            "16cm",
         ]
 
         if any(word.lower() in title for word in blocked):
+            continue
+
+        small_size = re.search(r'([0-1]?[0-9]|2[0-5](?:\.5)?)\s?cm', title)
+
+        if small_size:
             continue
 
         a = Anomaly(item=item)
