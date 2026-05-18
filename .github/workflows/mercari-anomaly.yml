@@ -25,10 +25,6 @@ jobs:
 
       - name: Install deps
         run: pip install -r mercari_anomaly/requirements.txt
-
-      - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
-
       - name: Run watcher
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
