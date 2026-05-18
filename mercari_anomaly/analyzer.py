@@ -63,10 +63,29 @@ def analyze(items: list[dict], previous_prices: dict[str, int | None]) -> list[A
     for item in items:
         title = item.get("title", "").lower()
 
-        if "キッズ" in title:
-            continue
+        blocked = [
+            "キッズ",
+            "レディース",
+            "スカート",
+            "パンツ",
+            "ハンガー",
+            "女の子",
+            "25.5cm",
+            "25cm",
+            "24.5cm",
+            "24cm",
+            "23.5cm",
+            "23cm",
+            "22.5cm",
+            "22cm",
+            "21.5cm",
+            "21cm",
+            "20.5cm",
+            "20cm",
+            "16cm",
+        ]
 
-        if "レディース" in title:
+        if any(word.lower() in title for word in blocked):
             continue
 
         a = Anomaly(item=item)
