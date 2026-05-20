@@ -65,30 +65,19 @@ def analyze(items: list[dict], previous_prices: dict[str, int | None]) -> list[A
         title = item.get("title", "").lower()
 
         required = [
-        "slippers",
-        "sandals",
-        "サンダル",
-        "スリッパ",
+        "demna balenciaga",
+        "デムナ balenciaga"
+        "デムナ バレンシアガ"
+        "demna vetements",
+        "デムナ vetements",
+        "デムナ ヴェトモン",
     ]
 
         if not any(word.lower() in title for word in required):
             continue    
 
         blocked = [
-            "キッズ",
-            "レディース",
-            "スカート",
-            "パンツ",
-            "ハンガー",
-            "女の子",
-            "ワンピース",
-            "カーディガン",
-            "ジーンズ",
-            "パンプス",
-            "ヒール",
-            "tシャツ",
-            "シャツ",
-            "ラック",
+          
         ]
 
         if any(word.lower() in title for word in blocked):
