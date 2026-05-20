@@ -29,10 +29,10 @@ ITEM_URL = "https://jp.mercari.com/item/{id}"
 DEBUG_DIR = os.environ.get("MERCARI_DEBUG_DIR", "debug")
 
 KEYWORDS = [
-    "slippers",
-    "sandals",
-    "サンダル",
-    "スリッパ",
+    "balenciaga",
+    "バレンシアガ",    
+    "vetements",
+    "ヴェトモン",
 ]
 
 USER_AGENT = (

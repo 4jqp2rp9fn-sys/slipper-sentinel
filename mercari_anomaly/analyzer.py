@@ -65,17 +65,8 @@ def analyze(items: list[dict], previous_prices: dict[str, int | None]) -> list[A
         title = item.get("title", "").lower()
 
         required = [
-        "balenciaga",
-        "バレンシアガ",    
-        "vetements",
-        "ヴェトモン",
-        "demna balenciaga",
-        "デムナ balenciaga"
-        "デムナ バレンシアガ"
-        "demna vetements",
-        "デムナ vetements",
-        "デムナ ヴェトモン",
-        "ヴェトモン",
+        "demna",
+        "デムナ"
     ]
 
         if not any(word.lower() in title for word in required):
