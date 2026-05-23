@@ -220,7 +220,8 @@ def _parse_items(data: dict, keyword: str) -> list[dict]:
             created = now
 
         out.append({
-            "id": item_id,
+            "id": f"mercari:{item_id}",
+            "source": "mercari",
             "title": (it.get("name") or it.get("title") or "").strip() or item_id,
             "price": price,
             "url": ITEM_URL.format(id=item_id),
