@@ -119,6 +119,7 @@ def analyze(items: list[dict], previous_prices: dict[str, int | None]) -> list[A
         cheaper_twins = [
             other for other in items
             if other["id"] != item["id"]
+            and other.get("source", "") == src
             and other.get("price", 0) > price > 0
             and _title_similar(item["title"], other["title"]) >= TITLE_SIMILARITY
         ]
