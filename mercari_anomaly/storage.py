@@ -1,8 +1,8 @@
-"""SQLite-backed storage for listing history.
+"""SQLite-backed storage for multi-marketplace listing history.
 
 Keeps the schema intentionally tiny so the file stays small and easy to
-inspect. We store every listing we've ever seen + the time we first saw it,
-and we record each price snapshot so we can detect drops.
+inspect. Each listing carries a `source` label (e.g. "mercari", "rakuten")
+so anomaly baselines and trend stats can be scoped per-marketplace.
 """
 from __future__ import annotations
 
@@ -30,12 +30,18 @@ def connect():
         conn.close()
 
 
+def _column_exists(c, table: str, column: str) -> bool:
+    rows = c.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
 def init_db() -> None:
     with connect() as c:
         c.executescript(
             """
             CREATE TABLE IF NOT EXISTS listings (
                 id TEXT PRIMARY KEY,
+                source TEXT DEFAULT 'mercari',
                 title TEXT,
                 price INTEGER,
                 url TEXT,
@@ -56,10 +62,15 @@ def init_db() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_listings_keyword ON listings(keyword);
+            CREATE INDEX IF NOT EXISTS idx_listings_source ON listings(source);
             CREATE INDEX IF NOT EXISTS idx_listings_first_seen ON listings(first_seen);
             CREATE INDEX IF NOT EXISTS idx_price_history_listing ON price_history(listing_id);
             """
         )
+        # Migration: add `source` column on pre-existing DBs.
+        if not _column_exists(c, "listings", "source"):
+            c.execute("ALTER TABLE listings ADD COLUMN source TEXT DEFAULT 'mercari'")
+            c.execute("UPDATE listings SET source = 'mercari' WHERE source IS NULL")
 
 
 def upsert_listing(item: dict) -> tuple[bool, int | None]:
@@ -72,10 +83,11 @@ def upsert_listing(item: dict) -> tuple[bool, int | None]:
         if row is None:
             c.execute(
                 """INSERT INTO listings
-                   (id,title,price,url,image,keyword,created_at,first_seen,last_seen,last_price)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                   (id,source,title,price,url,image,keyword,created_at,first_seen,last_seen,last_price)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     item["id"],
+                    item.get("source", "mercari"),
                     item["title"],
                     item["price"],
                     item["url"],
@@ -106,23 +118,36 @@ def upsert_listing(item: dict) -> tuple[bool, int | None]:
         return False, prev_price
 
 
-def recent_prices(keyword: str, since_seconds: int = 7 * 24 * 3600) -> list[int]:
+def recent_prices(
+    keyword: str,
+    since_seconds: int = 7 * 24 * 3600,
+    source: str | None = None,
+) -> list[int]:
     cutoff = int(time.time()) - since_seconds
+    sql = (
+        "SELECT price FROM listings "
+        "WHERE keyword = ? AND first_seen >= ? AND price > 0"
+    )
+    params: list = [keyword, cutoff]
+    if source:
+        sql += " AND source = ?"
+        params.append(source)
     with connect() as c:
-        rows = c.execute(
-            "SELECT price FROM listings WHERE keyword = ? AND first_seen >= ? AND price > 0",
-            (keyword, cutoff),
-        ).fetchall()
+        rows = c.execute(sql, params).fetchall()
     return [r["price"] for r in rows]
 
 
-def count_recent_listings(keyword: str, since_seconds: int) -> int:
+def count_recent_listings(
+    keyword: str, since_seconds: int, source: str | None = None,
+) -> int:
     cutoff = int(time.time()) - since_seconds
+    sql = "SELECT COUNT(*) AS n FROM listings WHERE keyword = ? AND first_seen >= ?"
+    params: list = [keyword, cutoff]
+    if source:
+        sql += " AND source = ?"
+        params.append(source)
     with connect() as c:
-        row = c.execute(
-            "SELECT COUNT(*) AS n FROM listings WHERE keyword = ? AND first_seen >= ?",
-            (keyword, cutoff),
-        ).fetchone()
+        row = c.execute(sql, params).fetchone()
     return int(row["n"])
 
 
