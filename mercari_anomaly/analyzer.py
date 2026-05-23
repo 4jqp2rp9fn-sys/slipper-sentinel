@@ -85,18 +85,19 @@ def analyze(items: list[dict], previous_prices: dict[str, int | None]) -> list[A
             continue
 
         a = Anomaly(item=item)
+        src = item.get("source", "")
         kw = item.get("keyword", "")
         price = item.get("price", 0) or 0
-        prices = [p for p in by_keyword_prices.get(kw, []) if p > 0]
+        prices = [p for p in by_bucket_prices.get((src, kw), []) if p > 0]
 
-        # 1) Underpriced vs recent baseline
+        # 1) Underpriced vs recent baseline (scoped per marketplace)
         if price > 0 and len(prices) >= MIN_SAMPLES:
             mean = statistics.mean(prices)
             stdev = statistics.pstdev(prices) or 1.0
             z = (price - mean) / stdev
             if z <= UNDERPRICED_Z:
                 a.add(
-                    f"Underpriced: ¥{price:,} vs avg ¥{int(mean):,} (z={z:.2f})",
+                    f"Underpriced on {src or 'market'}: ¥{price:,} vs avg ¥{int(mean):,} (z={z:.2f})",
                     weight=min(3.0, abs(z)),
                 )
 
@@ -111,8 +112,8 @@ def analyze(items: list[dict], previous_prices: dict[str, int | None]) -> list[A
                 )
 
         # 3) Listing frequency spike
-        if kw in spike_keywords:
-            a.add(f"Listing spike for '{kw}' in the last hour", weight=0.5)
+        if (src, kw) in spike_buckets:
+            a.add(f"Listing spike for '{kw}' on {src} in the last hour", weight=0.5)
 
         # 4) Same/similar title appearing cheaper than peers in this batch
         cheaper_twins = [
