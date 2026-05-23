@@ -45,21 +45,22 @@ def analyze(items: list[dict], previous_prices: dict[str, int | None]) -> list[A
     """
     anomalies: list[Anomaly] = []
 
-    # Group recent history by keyword for baseline stats
-    by_keyword_prices: dict[str, list[int]] = {}
+    # Group recent history by (source, keyword) for baseline stats
+    by_bucket_prices: dict[tuple[str, str], list[int]] = {}
     for it in items:
-        kw = it.get("keyword", "")
-        if kw not in by_keyword_prices:
-            by_keyword_prices[kw] = storage.recent_prices(kw)
+        bucket = (it.get("source", ""), it.get("keyword", ""))
+        if bucket not in by_bucket_prices:
+            by_bucket_prices[bucket] = storage.recent_prices(bucket[1], source=bucket[0] or None)
 
-    # Listing-frequency spike detection (per keyword)
-    spike_keywords: set[str] = set()
-    for kw in by_keyword_prices:
-        last_hour = storage.count_recent_listings(kw, 3600)
-        last_day = storage.count_recent_listings(kw, 24 * 3600)
+    # Listing-frequency spike detection (per source+keyword)
+    spike_buckets: set[tuple[str, str]] = set()
+    for bucket in by_bucket_prices:
+        src, kw = bucket
+        last_hour = storage.count_recent_listings(kw, 3600, source=src or None)
+        last_day = storage.count_recent_listings(kw, 24 * 3600, source=src or None)
         hourly_avg = last_day / 24 if last_day else 0
         if hourly_avg >= 1 and last_hour >= hourly_avg * LISTING_SPIKE_RATIO:
-            spike_keywords.add(kw)
+            spike_buckets.add(bucket)
 
     for item in items:
         title = item.get("title", "").lower()
